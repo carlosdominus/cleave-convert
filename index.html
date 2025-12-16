@@ -107,6 +107,7 @@
     "react/": "https://esm.sh/react@^19.2.1/",
     "react": "https://esm.sh/react@^19.2.1",
     "react-dom/": "https://esm.sh/react-dom@^19.2.1/",
+    "react-dom/client": "https://esm.sh/react-dom@^19.2.1/client",
     "@google/genai": "https://esm.sh/@google/genai@^1.32.0",
     "lucide-react": "https://esm.sh/lucide-react@^0.559.0",
     "jszip": "https://esm.sh/jszip@3.10.1"
@@ -116,7 +117,7 @@
 </head>
   <body>
     <div id="root"></div>
-    <!-- Load the main entry file using Babel to compile JSX/TSX on the fly -->
-    <script type="text/babel" data-presets="react,typescript" data-type="module" src="./index.tsx"></script>
+    <!-- Point directly to App.tsx which now contains the bundled logic -->
+    <script type="text/babel" data-presets="react,typescript" data-type="module" src="./App.tsx"></script>
   </body>
 </html>

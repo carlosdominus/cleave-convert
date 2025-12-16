@@ -1,5 +1,5 @@
-
 import React, { useState, useCallback, useRef, useEffect } from 'react';
+import ReactDOM from 'react-dom/client';
 import { 
   Upload, 
   Image as ImageIcon, 
@@ -23,9 +23,411 @@ import {
   Archive
 } from 'lucide-react';
 import JSZip from 'jszip';
-import { AppStatus, ConversionSettings, QueueItem, ProcessedResult, SupportedFormat } from './types.ts';
-import { processImageClientSide, formatBytes, blobToBase64 } from './services/imageProcessing.ts';
-import { analyzeImage } from './services/geminiService.ts';
+import { GoogleGenAI, Type } from "@google/genai";
+
+// --- TYPES (Previously types.ts) ---
+
+export type SupportedFormat = 'image/jpeg' | 'image/png' | 'image/webp' | 'image/avif' | 'image/svg+xml';
+
+export interface QueueItem {
+  id: string;
+  file: File;
+  previewUrl: string;
+  originalSize: number;
+  status: AppStatus;
+  result?: ProcessedResult;
+  error?: string;
+}
+
+export interface ConversionSettings {
+  format: SupportedFormat;
+  quality: number; // 0.1 to 1.0
+  resizeRatio: number; // 0.1 to 1.0
+  useAIAnalysis: boolean;
+  isVector: boolean;
+  colorCount: number; // 2 to 64
+}
+
+export interface ProcessedResult {
+  blob: Blob;
+  url: string;
+  size: number;
+  aiDescription?: string;
+  aiTags?: string[];
+}
+
+export enum AppStatus {
+  IDLE = 'IDLE',
+  PROCESSING = 'PROCESSING',
+  COMPLETE = 'COMPLETE',
+  ERROR = 'ERROR'
+}
+
+// --- GEMINI SERVICE (Previously services/geminiService.ts) ---
+
+const analyzeImage = async (
+  base64Data: string, 
+  mimeType: string
+): Promise<{ description: string; tags: string[] }> => {
+  try {
+    // Check if process is defined (handling browser environment safety)
+    const apiKey = typeof process !== 'undefined' && process.env ? process.env.API_KEY : undefined;
+    
+    if (!apiKey) {
+      console.warn("API Key missing, skipping AI analysis");
+      return { description: "AI Analysis unavailable (Missing Key)", tags: [] };
+    }
+
+    const ai = new GoogleGenAI({ apiKey });
+    
+    const response = await ai.models.generateContent({
+      model: 'gemini-2.5-flash',
+      contents: {
+        parts: [
+          {
+            inlineData: {
+              data: base64Data,
+              mimeType: mimeType
+            }
+          },
+          {
+            text: "Analyze this image. Provide a short, professional description (max 20 words) suitable for file metadata, and a list of 5 relevant keyword tags."
+          }
+        ]
+      },
+      config: {
+        responseMimeType: "application/json",
+        responseSchema: {
+          type: Type.OBJECT,
+          properties: {
+            description: { type: Type.STRING },
+            tags: { 
+              type: Type.ARRAY,
+              items: { type: Type.STRING }
+            }
+          },
+          required: ["description", "tags"]
+        }
+      }
+    });
+
+    const text = response.text;
+    if (!text) throw new Error("No response from Gemini");
+
+    return JSON.parse(text);
+
+  } catch (error) {
+    console.error("Gemini Analysis Failed:", error);
+    return { description: "Analysis failed", tags: [] };
+  }
+};
+
+// --- IMAGE PROCESSING SERVICE (Previously services/imageProcessing.ts) ---
+
+const blobToBase64 = (blob: Blob): Promise<string> => {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onloadend = () => {
+      const base64String = reader.result as string;
+      const base64Data = base64String.split(',')[1];
+      resolve(base64Data);
+    };
+    reader.onerror = reject;
+    reader.readAsDataURL(blob);
+  });
+};
+
+const formatBytes = (bytes: number, decimals = 2) => {
+  if (!+bytes) return '0 Bytes';
+  const k = 1024;
+  const dm = decimals < 0 ? 0 : decimals;
+  const sizes = ['Bytes', 'KB', 'MB', 'GB'];
+  const i = Math.floor(Math.log(bytes) / Math.log(k));
+  return `${parseFloat((bytes / Math.pow(k, i)).toFixed(dm))} ${sizes[i]}`;
+};
+
+// K-Means Color Quantization Helpers
+interface Rgb { r: number; g: number; b: number; }
+
+const getPixelColor = (data: Uint8ClampedArray, i: number): Rgb => ({
+  r: data[i],
+  g: data[i + 1],
+  b: data[i + 2]
+});
+
+const colorDistance = (c1: Rgb, c2: Rgb) => {
+  return Math.sqrt(
+    Math.pow(c1.r - c2.r, 2) + 
+    Math.pow(c1.g - c2.g, 2) + 
+    Math.pow(c1.b - c2.b, 2)
+  );
+};
+
+const rgbToHex = (c: Rgb) => {
+  return "#" + ((1 << 24) + (c.r << 16) + (c.g << 8) + c.b).toString(16).slice(1);
+};
+
+// Simplified K-Means to find dominant colors
+const extractPalette = (data: Uint8ClampedArray, pixelCount: number, k: number): Rgb[] => {
+  let centroids: Rgb[] = [];
+  const step = Math.floor(pixelCount / k);
+  for (let i = 0; i < k; i++) {
+    centroids.push(getPixelColor(data, (i * step) * 4));
+  }
+
+  for (let iter = 0; iter < 5; iter++) {
+    const sums = centroids.map(() => ({ r: 0, g: 0, b: 0, count: 0 }));
+    for (let i = 0; i < data.length; i += 16) { 
+      const p = getPixelColor(data, i);
+      let minDist = Infinity;
+      let closestIndex = 0;
+      for (let j = 0; j < k; j++) {
+        const dist = colorDistance(p, centroids[j]);
+        if (dist < minDist) {
+          minDist = dist;
+          closestIndex = j;
+        }
+      }
+      sums[closestIndex].r += p.r;
+      sums[closestIndex].g += p.g;
+      sums[closestIndex].b += p.b;
+      sums[closestIndex].count++;
+    }
+    for (let j = 0; j < k; j++) {
+      if (sums[j].count > 0) {
+        centroids[j] = {
+          r: Math.floor(sums[j].r / sums[j].count),
+          g: Math.floor(sums[j].g / sums[j].count),
+          b: Math.floor(sums[j].b / sums[j].count)
+        };
+      }
+    }
+  }
+  return centroids;
+};
+
+// Vector Tracing Helpers
+const LINE_LOOKUP: number[][][] = [
+  [], [[3, 2]], [[2, 1]], [[3, 1]], [[1, 0]], [[0, 3], [1, 2]], [[2, 0]], [[3, 0]], 
+  [[0, 3]], [[0, 2]], [[0, 1], [3, 2]], [[0, 1]], [[1, 3]], [[1, 2]], [[2, 3]], []
+];
+
+interface Point { x: number; y: number; }
+
+const traceLayer = (
+  width: number, 
+  height: number, 
+  isColorFunc: (x: number, y: number) => boolean
+): string => {
+  const visited = new Set<string>();
+  let pathData = "";
+
+  const getEdgePos = (x: number, y: number, edge: number): Point => {
+    switch (edge) {
+      case 0: return { x: x + 0.5, y: y };       
+      case 1: return { x: x + 1, y: y + 0.5 };   
+      case 2: return { x: x + 0.5, y: y + 1 };   
+      case 3: return { x: x, y: y + 0.5 };       
+      default: return { x, y };
+    }
+  };
+
+  for (let y = 0; y < height - 1; y++) {
+    for (let x = 0; x < width - 1; x++) {
+      const key = `${x},${y}`;
+      if (visited.has(key)) continue;
+
+      let idx = 0;
+      if (isColorFunc(x, y + 1)) idx |= 1;
+      if (isColorFunc(x + 1, y + 1)) idx |= 2;
+      if (isColorFunc(x + 1, y)) idx |= 4;
+      if (isColorFunc(x, y)) idx |= 8;
+
+      if (idx === 0 || idx === 15) continue; 
+
+      const lines = LINE_LOOKUP[idx];
+      
+      if (lines.length > 0) {
+        let points: Point[] = [];
+        let currX = x;
+        let currY = y;
+        let startEdge = lines[0][0]; 
+        let nextEdge = lines[0][1]; 
+        let steps = 0;
+        const maxSteps = width * height;
+
+        points.push(getEdgePos(currX, currY, startEdge));
+
+        while (steps < maxSteps) {
+          visited.add(`${currX},${currY}`);
+          points.push(getEdgePos(currX, currY, nextEdge));
+
+          if (nextEdge === 0) currY--;
+          else if (nextEdge === 1) currX++;
+          else if (nextEdge === 2) currY++;
+          else if (nextEdge === 3) currX--;
+
+          if (currX < 0 || currX >= width - 1 || currY < 0 || currY >= height - 1) break;
+
+          let nIdx = 0;
+          if (isColorFunc(currX, currY + 1)) nIdx |= 1;
+          if (isColorFunc(currX + 1, currY + 1)) nIdx |= 2;
+          if (isColorFunc(currX + 1, currY)) nIdx |= 4;
+          if (isColorFunc(currX, currY)) nIdx |= 8;
+          
+          if (nIdx === 0 || nIdx === 15) break;
+
+          const arrivalEdge = (nextEdge + 2) % 4; 
+          const nextLines = LINE_LOOKUP[nIdx];
+          const segment = nextLines.find(s => s[0] === arrivalEdge);
+          
+          if (!segment) break; 
+          
+          startEdge = segment[0];
+          nextEdge = segment[1];
+          
+          if (currX === x && currY === y && startEdge === lines[0][0]) {
+             break;
+          }
+          steps++;
+        }
+
+        if (points.length > 2) {
+          const len = points.length;
+          const lastP = points[len - 1];
+          const firstP = points[0];
+          const startX = (lastP.x + firstP.x) / 2;
+          const startY = (lastP.y + firstP.y) / 2;
+
+          pathData += `M ${startX} ${startY} `;
+
+          for (let i = 0; i < len; i++) {
+             const curr = points[i];
+             const next = points[(i + 1) % len];
+             const midX = (curr.x + next.x) / 2;
+             const midY = (curr.y + next.y) / 2;
+             pathData += `Q ${curr.x} ${curr.y} ${midX} ${midY} `;
+          }
+          pathData += "Z ";
+        }
+      }
+    }
+  }
+  return pathData;
+};
+
+const processImageClientSide = async (
+  file: File, 
+  format: SupportedFormat, 
+  quality: number,
+  scale: number,
+  isVector: boolean = false,
+  colorCount: number = 8
+): Promise<Blob> => {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    const url = URL.createObjectURL(file);
+    
+    img.onload = () => {
+      URL.revokeObjectURL(url);
+      
+      const canvas = document.createElement('canvas');
+      const ctx = canvas.getContext('2d', { willReadFrequently: true });
+      
+      if (!ctx) {
+        reject(new Error('Canvas context unavailable'));
+        return;
+      }
+
+      let targetWidth = Math.floor(img.width * scale);
+      let targetHeight = Math.floor(img.height * scale);
+
+      if (isVector) {
+        const maxVectorDimension = 1024; 
+        if (targetWidth > maxVectorDimension || targetHeight > maxVectorDimension) {
+           const ratio = Math.min(maxVectorDimension / targetWidth, maxVectorDimension / targetHeight);
+           targetWidth = Math.floor(targetWidth * ratio);
+           targetHeight = Math.floor(targetHeight * ratio);
+        }
+      }
+
+      canvas.width = targetWidth;
+      canvas.height = targetHeight;
+      ctx.drawImage(img, 0, 0, targetWidth, targetHeight);
+
+      if (isVector) {
+        const imageData = ctx.getImageData(0, 0, targetWidth, targetHeight);
+        const data = imageData.data;
+        const palette = extractPalette(data, targetWidth * targetHeight, colorCount);
+        const colorIndices = new Uint8Array(targetWidth * targetHeight);
+        for (let i = 0; i < data.length; i += 4) {
+           const p = { r: data[i], g: data[i+1], b: data[i+2] };
+           let closest = 0;
+           let min = Infinity;
+           for (let c = 0; c < palette.length; c++) {
+              const d = colorDistance(p, palette[c]);
+              if (d < min) { min = d; closest = c; }
+           }
+           colorIndices[i / 4] = closest;
+        }
+
+        let svgContent = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${targetWidth} ${targetHeight}">`;
+        svgContent += `<rect width="100%" height="100%" fill="${rgbToHex(palette[0])}"/>`;
+
+        for (let c = 0; c < palette.length; c++) {
+          const hex = rgbToHex(palette[c]);
+          const isColor = (x: number, y: number) => {
+            if (x < 0 || y < 0 || x >= targetWidth || y >= targetHeight) return false;
+            return colorIndices[y * targetWidth + x] === c;
+          };
+
+          const d = traceLayer(targetWidth, targetHeight, isColor);
+          if (d.length > 0) {
+            svgContent += `<path d="${d}" fill="${hex}" />`;
+          }
+        }
+
+        svgContent += `</svg>`;
+        resolve(new Blob([svgContent], { type: 'image/svg+xml' }));
+        return;
+      }
+
+      if (!isVector) {
+          ctx.imageSmoothingEnabled = true;
+          ctx.imageSmoothingQuality = 'high';
+      }
+
+      if (format === 'image/jpeg') {
+        const tempCanvas = document.createElement('canvas');
+        tempCanvas.width = targetWidth;
+        tempCanvas.height = targetHeight;
+        const tempCtx = tempCanvas.getContext('2d');
+        if (tempCtx) {
+            tempCtx.fillStyle = '#FFFFFF';
+            tempCtx.fillRect(0, 0, targetWidth, targetHeight);
+            tempCtx.drawImage(canvas, 0, 0);
+            tempCanvas.toBlob(
+                (blob) => blob ? resolve(blob) : reject(new Error('Conversion failed')),
+                format,
+                quality
+            );
+            return;
+        }
+      }
+
+      canvas.toBlob(
+        (blob) => blob ? resolve(blob) : reject(new Error('Conversion failed')),
+        format,
+        quality
+      );
+    };
+    
+    img.onerror = () => reject(new Error('Failed to load image'));
+    img.src = url;
+  });
+};
+
+// --- APP COMPONENT ---
 
 const App: React.FC = () => {
   // State
@@ -112,7 +514,6 @@ const App: React.FC = () => {
     ));
 
     // Process sequentially to avoid freezing UI too much (or parallel if light)
-    // For AI/Vector, sequential is safer for browser performance
     for (const item of itemsToProcess) {
       try {
         const blob = await processImageClientSide(
@@ -186,8 +587,6 @@ const App: React.FC = () => {
       completedItems.forEach(item => {
         if (item.result) {
            const originalName = item.file.name.split('.')[0] || 'image';
-           // Handle duplicate names if necessary (simple increment could be added here, 
-           // but JSZip handles overwrites by updating. To be safe, we assume unique inputs or accept overwrite)
            const filename = `${originalName}_converted.${ext}`;
            zip.file(filename, item.result.blob);
         }
