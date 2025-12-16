@@ -28,9 +28,9 @@ import { GoogleGenAI, Type } from "@google/genai";
 
 // --- TYPES ---
 
-export type SupportedFormat = 'image/jpeg' | 'image/png' | 'image/webp' | 'image/avif' | 'image/svg+xml';
+type SupportedFormat = 'image/jpeg' | 'image/png' | 'image/webp' | 'image/avif' | 'image/svg+xml';
 
-export interface QueueItem {
+interface QueueItem {
   id: string;
   file: File;
   previewUrl: string;
@@ -40,7 +40,7 @@ export interface QueueItem {
   error?: string;
 }
 
-export interface ConversionSettings {
+interface ConversionSettings {
   format: SupportedFormat;
   quality: number; // 0.1 to 1.0
   resizeRatio: number; // 0.1 to 1.0
@@ -49,7 +49,7 @@ export interface ConversionSettings {
   colorCount: number; // 2 to 64
 }
 
-export interface ProcessedResult {
+interface ProcessedResult {
   blob: Blob;
   url: string;
   size: number;
@@ -57,7 +57,7 @@ export interface ProcessedResult {
   aiTags?: string[];
 }
 
-export enum AppStatus {
+enum AppStatus {
   IDLE = 'IDLE',
   PROCESSING = 'PROCESSING',
   COMPLETE = 'COMPLETE',
